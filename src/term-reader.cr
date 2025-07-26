@@ -1,3 +1,4 @@
+
 require "term-cursor"
 require "term-screen"
 
@@ -17,8 +18,9 @@ module Term
     # Key codes
     CARRIAGE_RETURN = 13
     NEWLINE         = 10
-    BACKSPACE       =  8
-    DELETE          = 27
+    BACKSPACE       = 8
+    ESC             = 27
+    DELETE          = 127
 
     getter input : IO::FileDescriptor
     getter output : IO::FileDescriptor
@@ -89,7 +91,7 @@ module Term
       @output.sync = buffering
     end
 
-    # Reads a keypress, including ivisible multibyte codes
+    # Reads a keypress, including invisible multibyte codes
     # and return a character as a String.
     #
     # Nothing is echoed to the console. This call will block for
@@ -103,13 +105,25 @@ module Term
     end
 
     # Get input code points
-    # FIXME: Fails to handle escape '\e' all by itself
+    # Fixed to handle escape '\e' all by itself correctly
     def get_codes(echo : Bool, raw : Bool, nonblock : Bool, interrupt : Symbol | Proc = @interrupt) : Array(Int32)?
       char = console.get_char(echo, raw, nonblock)
       handle_interrupt(interrupt) if console.keys[char.to_s]? == "ctrl_c"
       return nil if char.nil?
 
       codes = [char.ord] of Int32
+
+      # Special handling: if first code is ESC and no next char immediately,
+      # return ESC alone
+      if codes[0] == ESC
+        next_char = console.get_char(echo, raw, true) # nonblocking true
+        if next_char.nil?
+          return codes # just ESC alone
+        else
+          codes << next_char.ord
+        end
+      end
+
       condition = ->(escape : Array(UInt8)) do
         (codes - escape).empty? ||
         (escape - codes).empty? &&
@@ -314,56 +328,32 @@ module Term
       io << '>'
     end
 
-    private def unpack_array(arr : Array(Int32)) : String
-      io = IO::Memory.new
-      arr.each do |i|
-        io.write_bytes(i)
+    private def trigger_key_event(char : String, line : String? = nil) : Nil
+      # triggers event handlers matching key name or global handlers
+      key_name = console.keys[char]?
+
+      handlers = @event_handlers[key_name.to_s] + @event_handlers[""]
+      handlers.each do |handler|
+        handler.call(char, KeyEvent.new(char, key_name, line))
       end
-      io.rewind
-      io.gets_to_end
-    end
-
-    # Publish event
-    private def trigger_key_event(char : String, line : String = "") : Nil
-      event = KeyEvent.from(console.keys, char, line)
-      key = event.key.name
-
-      (@event_handlers[key] +
-        @event_handlers[""] +
-        self.class.global_handlers[key] +
-        self.class.global_handlers[""]).each do |proc|
-        proc.call(event.key.name, event)
+      self.class.global_handlers[key_name.to_s].each do |handler|
+        handler.call(char, KeyEvent.new(char, key_name, line))
       end
     end
 
-    # Handle input interrupt based on provided value
-    private def handle_interrupt(interrupt : Symbol | Proc = @interrupt) : Nil
+    private def handle_interrupt(interrupt : Symbol | Proc)
       case interrupt
-      when :signal
-        Process.signal(:int, Process.pid)
       when :exit
-        exit(130)
-      when Proc
-        interrupt.as(Proc).call
+        exit 130
+      when :error
+        raise InputInterrupt.new("Interrupted by Ctrl-C")
       when :noop
-        return
+        # do nothing
+      when Proc
+        interrupt.call
       else
-        # Ctrl-C
-        raise InputInterrupt.new("Ctrl-c was pressed")
+        raise InputInterrupt.new("Unknown interrupt handler: #{interrupt.inspect}")
       end
-    end
-
-    macro subscribe(*keys)
-      {% valid_keys = (Term::Reader::CONTROL_KEYS.values + Term::Reader::KEYS.values).uniq %}
-      {% for key in keys %}
-        {% if key.id.symbolize == :keypress %}
-          %kp = Term::Reader::HandlerFunc.new { |k, e| self.keypress(k, e); nil }
-          Term::Reader.global_handlers[""] << %kp
-        {% elsif valid_keys.includes?(key.id.stringify) %}
-          %kp{key.id} = Term::Reader::HandlerFunc.new { |k, e| self.key{{ key.id }}; nil }
-          Term::Reader.global_handlers[{{ key.id.stringify }}] << %kp{key.id}
-        {% end %}
-      {% end %}
     end
   end
 end
